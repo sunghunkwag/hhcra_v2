@@ -26,17 +26,21 @@ class HHCRACoreRegressionTests(unittest.TestCase):
             train_epochs_l3=1,
         )
 
-    def test_causal_graph_traversal_and_dag_check(self):
-        adjacency = np.zeros((4, 4))
-        edges = [
-            (0, 1, 1.0),
-            (1, 2, 1.0),
-            (0, 3, 1.0),
-        ]
+    def make_graph(self, node_count, edges):
+        adjacency = np.zeros((node_count, node_count))
         for parent, child, _ in edges:
             adjacency[child, parent] = 1.0
+        return CausalGraphData(nodes=list(range(node_count)), edges=edges, adjacency=adjacency)
 
-        graph = CausalGraphData(nodes=[0, 1, 2, 3], edges=edges, adjacency=adjacency)
+    def test_causal_graph_traversal_and_dag_check(self):
+        graph = self.make_graph(
+            4,
+            [
+                (0, 1, 1.0),
+                (1, 2, 1.0),
+                (0, 3, 1.0),
+            ],
+        )
 
         self.assertTrue(graph.is_dag())
         self.assertEqual(graph.parents(2), {1})
@@ -46,17 +50,48 @@ class HHCRACoreRegressionTests(unittest.TestCase):
         self.assertTrue(graph.has_edge(1, 2))
         self.assertEqual(graph.edge_count(), 3)
 
-    def test_d_separation_blocks_observed_chain_middle(self):
-        adjacency = np.zeros((3, 3))
-        edges = [(0, 1, 1.0), (1, 2, 1.0)]
-        for parent, child, _ in edges:
-            adjacency[child, parent] = 1.0
+    def test_causal_graph_rejects_directed_cycle(self):
+        graph = self.make_graph(
+            3,
+            [
+                (0, 1, 1.0),
+                (1, 2, 1.0),
+                (2, 0, 1.0),
+            ],
+        )
 
-        graph = CausalGraphData(nodes=[0, 1, 2], edges=edges, adjacency=adjacency)
+        self.assertFalse(graph.is_dag())
+
+    def test_d_separation_blocks_observed_chain_middle(self):
+        graph = self.make_graph(3, [(0, 1, 1.0), (1, 2, 1.0)])
         engine = NeuroSymbolicEngine()
 
         self.assertFalse(engine.d_separated(graph, 0, 2, set()))
         self.assertTrue(engine.d_separated(graph, 0, 2, {1}))
+
+    def test_d_separation_handles_forks_and_observed_common_causes(self):
+        graph = self.make_graph(3, [(1, 0, 1.0), (1, 2, 1.0)])
+        engine = NeuroSymbolicEngine()
+
+        self.assertFalse(engine.d_separated(graph, 0, 2, set()))
+        self.assertTrue(engine.d_separated(graph, 0, 2, {1}))
+
+    def test_d_separation_handles_colliders_and_observed_colliders(self):
+        graph = self.make_graph(3, [(0, 1, 1.0), (2, 1, 1.0)])
+        engine = NeuroSymbolicEngine()
+
+        self.assertTrue(engine.d_separated(graph, 0, 2, set()))
+        self.assertFalse(engine.d_separated(graph, 0, 2, {1}))
+
+    def test_backdoor_identifiability_returns_minimal_adjustment_set(self):
+        graph = self.make_graph(3, [(2, 0, 1.0), (2, 1, 1.0), (0, 1, 1.0)])
+        engine = NeuroSymbolicEngine()
+
+        result = engine.check_identifiability(graph, 0, 1)
+
+        self.assertTrue(result["identifiable"])
+        self.assertEqual(result["strategy"], "backdoor")
+        self.assertEqual(result["adjustment_set"], {2})
 
     def test_gnn_prune_to_dag_removes_cycles_and_self_loops(self):
         config = self.small_config()
