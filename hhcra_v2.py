@@ -54,6 +54,15 @@ import time
 import sys
 
 
+def configure_stdout():
+    """Use UTF-8 for the demo output when the host console supports it."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 # ===========================================================================
 # 0. Configuration
 # ===========================================================================
@@ -581,6 +590,33 @@ class CausalGraphData:
     nodes: List[int]
     edges: List[Tuple[int, int, float]]  # (parent, child, weight)
     adjacency: np.ndarray
+    latent_nodes: Set[int] = field(default_factory=set)
+
+    def __post_init__(self):
+        self.latent_nodes = set(self.latent_nodes)
+
+    @classmethod
+    def from_edges(cls, node_count: int, edges, latent_nodes: Optional[Set[int]] = None):
+        """Build a graph from edge tuples while keeping hidden variables explicit."""
+        normalized_edges = []
+        adjacency = np.zeros((node_count, node_count))
+        for edge in edges:
+            if len(edge) == 2:
+                parent, child = edge
+                weight = 1.0
+            else:
+                parent, child, weight = edge
+            normalized_edges.append((parent, child, float(weight)))
+            adjacency[child, parent] = float(weight)
+        return cls(
+            nodes=list(range(node_count)),
+            edges=normalized_edges,
+            adjacency=adjacency,
+            latent_nodes=set(latent_nodes or set()),
+        )
+
+    def observed_nodes(self) -> Set[int]:
+        return set(self.nodes) - self.latent_nodes
 
     def parents(self, n: int) -> Set[int]:
         return {p for p, c, _ in self.edges if c == n}
@@ -651,39 +687,17 @@ class NeuroSymbolicEngine:
         """
         Test if X ⊥ Y | Z using Bayes-Ball algorithm.
 
-        Returns True if X and Y are d-separated given Z.
+        Uses the active-path criterion over simple undirected paths, including
+        collider activation through conditioned descendants.
         """
-        visited = set()
-        queue = [(X, 'up')]
+        if X == Y:
+            return False
 
-        while queue:
-            node, direction = queue.pop(0)
-
-            if node == Y:
-                return False  # Y reachable => not d-separated
-
-            if (node, direction) in visited:
-                continue
-            visited.add((node, direction))
-
-            if direction == 'up':
-                if node not in Z:
-                    # Visit parents (upward) and children (downward)
-                    for p in G.parents(node):
-                        queue.append((p, 'up'))
-                    for c in G.children(node):
-                        queue.append((c, 'down'))
-            else:  # 'down'
-                if node not in Z:
-                    # Continue downward through children
-                    for c in G.children(node):
-                        queue.append((c, 'down'))
-                if node in Z:
-                    # Collider activated: visit parents
-                    for p in G.parents(node):
-                        queue.append((p, 'up'))
-
-        return True  # Y not reachable => d-separated
+        conditioned = set(Z)
+        for path in self._simple_paths_undirected(G, X, Y):
+            if self._path_active(G, path, conditioned):
+                return False
+        return True
 
     def find_backdoor_set(self, G: CausalGraphData, X: int, Y: int) -> Optional[Set[int]]:
         """
@@ -694,15 +708,12 @@ class NeuroSymbolicEngine:
         2. Z blocks every backdoor path (path with arrow into X)
         """
         descendants_X = G.descendants(X)
-        candidates = set(G.nodes) - {X, Y} - descendants_X
+        candidates = G.observed_nodes() - {X, Y} - descendants_X
 
         # Try sets from smallest to largest
         for size in range(len(candidates) + 1):
             for subset in self._power_subsets(candidates, size):
                 Z = set(subset)
-                # Check: Z blocks all non-causal paths from X to Y
-                # In practice: d-separate X from Y after removing X's outgoing edges
-                # Simplified: check d-separation in manipulated graph
                 if self._blocks_backdoor(G, X, Y, Z):
                     return Z
 
@@ -710,10 +721,10 @@ class NeuroSymbolicEngine:
 
     def find_frontdoor_set(self, G: CausalGraphData, X: int, Y: int) -> Optional[Set[int]]:
         """
-        Find frontdoor adjustment set: mediators M where
-        1. X intercepts all directed paths from X to M
-        2. No unblocked backdoor X to M
-        3. X blocks all backdoor M to Y
+        Find a frontdoor adjustment set Z where
+        1. Z intercepts all directed paths from X to Y
+        2. There is no unblocked backdoor path from X to any z in Z
+        3. X blocks all backdoor paths from each z in Z to Y
         """
         paths = self._directed_paths(G, X, Y)
         if not paths:
@@ -723,15 +734,31 @@ class NeuroSymbolicEngine:
         for path in paths:
             mediators.update(path[1:-1])
 
+        mediators -= G.latent_nodes
         if not mediators:
             return None
 
-        # Verify frontdoor conditions
-        for m in mediators:
-            if not self._blocks_backdoor(G, m, Y, {X}):
-                return None
+        for size in range(1, len(mediators) + 1):
+            for subset in self._power_subsets(mediators, size):
+                Z = set(subset)
+                if self._valid_frontdoor_set(G, X, Y, Z, paths):
+                    return Z
 
-        return mediators
+        return None
+
+    def _valid_frontdoor_set(self, G, X, Y, Z, directed_paths):
+        """Check Pearl's frontdoor criterion for an observed mediator set."""
+        for path in directed_paths:
+            if not any(node in Z for node in path[1:-1]):
+                return False
+
+        for z in Z:
+            if not self._blocks_backdoor(G, X, z, set()):
+                return False
+            if not self._blocks_backdoor(G, z, Y, {X}):
+                return False
+
+        return True
 
     def check_identifiability(self, G: CausalGraphData, X: int, Y: int) -> dict:
         """
@@ -768,8 +795,47 @@ class NeuroSymbolicEngine:
             nodes=list(G.nodes),
             edges=mutilated_edges,
             adjacency=mutilated_adjacency,
+            latent_nodes=set(G.latent_nodes),
         )
         return self.d_separated(mutilated, X, Y, Z)
+
+    def _simple_paths_undirected(self, G, start, end, max_depth=12):
+        """Enumerate simple undirected paths used by the active-path criterion."""
+        paths = []
+        queue = [[start]]
+        while queue:
+            path = queue.pop(0)
+            node = path[-1]
+            if len(path) > max_depth:
+                continue
+            if node == end and len(path) > 1:
+                paths.append(path)
+                continue
+            neighbors = G.parents(node) | G.children(node)
+            for nxt in sorted(neighbors):
+                if nxt not in path:
+                    queue.append(path + [nxt])
+        return paths
+
+    def _path_active(self, G, path: List[int], Z: Set[int]) -> bool:
+        """Return True when every internal node keeps this path active."""
+        if len(path) <= 2:
+            return True
+
+        for i in range(1, len(path) - 1):
+            left = path[i - 1]
+            middle = path[i]
+            right = path[i + 1]
+            is_collider = G.has_edge(left, middle) and G.has_edge(right, middle)
+
+            if is_collider:
+                collider_open = middle in Z or bool(G.descendants(middle) & Z)
+                if not collider_open:
+                    return False
+            elif middle in Z:
+                return False
+
+        return True
 
     def _directed_paths(self, G, start, end, max_depth=10):
         """Find all directed paths from start to end."""
@@ -1300,6 +1366,69 @@ class TestResult:
         return f"  [{status}] {self.name}" + (f" — {self.detail}" if self.detail else "")
 
 
+class StructuralCausalBenchmark:
+    """Canonical symbolic SCM checks for the deterministic reasoning layer."""
+
+    def __init__(self, engine: Optional[NeuroSymbolicEngine] = None):
+        self.engine = engine or NeuroSymbolicEngine()
+
+    def run(self) -> List[TestResult]:
+        e = self.engine
+        results = []
+
+        chain = CausalGraphData.from_edges(3, [(0, 1), (1, 2)])
+        results.append(TestResult(
+            "Benchmark: chain blocks when middle node is observed",
+            not e.d_separated(chain, 0, 2, set()) and e.d_separated(chain, 0, 2, {1}),
+            "X0 -> X1 -> X2",
+        ))
+
+        collider = CausalGraphData.from_edges(4, [(0, 1), (2, 1), (1, 3)])
+        results.append(TestResult(
+            "Benchmark: collider opens through observed descendant",
+            e.d_separated(collider, 0, 2, set()) and not e.d_separated(collider, 0, 2, {3}),
+            "X0 -> X1 <- X2, X1 -> X3",
+        ))
+
+        backdoor = CausalGraphData.from_edges(3, [(2, 0), (2, 1), (0, 1)])
+        backdoor_id = e.check_identifiability(backdoor, 0, 1)
+        results.append(TestResult(
+            "Benchmark: observed confounder yields minimal backdoor set",
+            backdoor_id["identifiable"]
+            and backdoor_id["strategy"] == "backdoor"
+            and backdoor_id["adjustment_set"] == {2},
+            f"result={backdoor_id}",
+        ))
+
+        frontdoor = CausalGraphData.from_edges(
+            4,
+            [(3, 0), (3, 1), (0, 2), (2, 1)],
+            latent_nodes={3},
+        )
+        frontdoor_id = e.check_identifiability(frontdoor, 0, 1)
+        results.append(TestResult(
+            "Benchmark: latent confounder can be identified by frontdoor",
+            frontdoor_id["identifiable"]
+            and frontdoor_id["strategy"] == "frontdoor"
+            and frontdoor_id["adjustment_set"] == {2},
+            f"result={frontdoor_id}",
+        ))
+
+        hidden_confounder = CausalGraphData.from_edges(
+            3,
+            [(2, 0), (2, 1), (0, 1)],
+            latent_nodes={2},
+        )
+        hidden_id = e.check_identifiability(hidden_confounder, 0, 1)
+        results.append(TestResult(
+            "Benchmark: latent confounder without mediator is not identified",
+            not hidden_id["identifiable"],
+            f"result={hidden_id}",
+        ))
+
+        return results
+
+
 def run_verification_tests(model: HHCRA, observations: np.ndarray,
                            ground_truth: dict) -> List[TestResult]:
     """
@@ -1498,6 +1627,21 @@ def run_verification_tests(model: HHCRA, observations: np.ndarray,
     except Exception as e:
         results.append(TestResult("Liquid Net: Intervention effect", False, str(e)))
 
+    # --- Test 13: Structural causal benchmark ---
+    try:
+        benchmark_results = StructuralCausalBenchmark(model.layer3.symbolic).run()
+        passed = sum(1 for r in benchmark_results if r.passed)
+        failures = [r.name for r in benchmark_results if not r.passed]
+        detail = f"{passed}/{len(benchmark_results)} cases passed"
+        if failures:
+            detail += f"; failures: {failures}"
+        results.append(TestResult(
+            "Structural benchmark: canonical SCM cases",
+            passed == len(benchmark_results),
+            detail))
+    except Exception as e:
+        results.append(TestResult("Structural benchmark: canonical SCM cases", False, str(e)))
+
     return results
 
 
@@ -1506,6 +1650,7 @@ def run_verification_tests(model: HHCRA, observations: np.ndarray,
 # ===========================================================================
 
 def main():
+    configure_stdout()
     start_time = time.time()
 
     print("=" * 60)

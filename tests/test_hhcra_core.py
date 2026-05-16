@@ -8,6 +8,7 @@ from hhcra_v2 import (
     HHCRAConfig,
     LiquidNeuralNet,
     NeuroSymbolicEngine,
+    StructuralCausalBenchmark,
 )
 
 
@@ -27,10 +28,7 @@ class HHCRACoreRegressionTests(unittest.TestCase):
         )
 
     def make_graph(self, node_count, edges):
-        adjacency = np.zeros((node_count, node_count))
-        for parent, child, _ in edges:
-            adjacency[child, parent] = 1.0
-        return CausalGraphData(nodes=list(range(node_count)), edges=edges, adjacency=adjacency)
+        return CausalGraphData.from_edges(node_count, edges)
 
     def test_causal_graph_traversal_and_dag_check(self):
         graph = self.make_graph(
@@ -83,6 +81,13 @@ class HHCRACoreRegressionTests(unittest.TestCase):
         self.assertTrue(engine.d_separated(graph, 0, 2, set()))
         self.assertFalse(engine.d_separated(graph, 0, 2, {1}))
 
+    def test_d_separation_opens_collider_with_observed_descendant(self):
+        graph = self.make_graph(4, [(0, 1, 1.0), (2, 1, 1.0), (1, 3, 1.0)])
+        engine = NeuroSymbolicEngine()
+
+        self.assertTrue(engine.d_separated(graph, 0, 2, set()))
+        self.assertFalse(engine.d_separated(graph, 0, 2, {3}))
+
     def test_backdoor_identifiability_returns_minimal_adjustment_set(self):
         graph = self.make_graph(3, [(2, 0, 1.0), (2, 1, 1.0), (0, 1, 1.0)])
         engine = NeuroSymbolicEngine()
@@ -92,6 +97,37 @@ class HHCRACoreRegressionTests(unittest.TestCase):
         self.assertTrue(result["identifiable"])
         self.assertEqual(result["strategy"], "backdoor")
         self.assertEqual(result["adjustment_set"], {2})
+
+    def test_latent_confounder_without_mediator_is_not_identified(self):
+        graph = CausalGraphData.from_edges(
+            3,
+            [(2, 0), (2, 1), (0, 1)],
+            latent_nodes={2},
+        )
+        engine = NeuroSymbolicEngine()
+
+        result = engine.check_identifiability(graph, 0, 1)
+
+        self.assertFalse(result["identifiable"])
+
+    def test_frontdoor_identifiability_with_latent_confounder(self):
+        graph = CausalGraphData.from_edges(
+            4,
+            [(3, 0), (3, 1), (0, 2), (2, 1)],
+            latent_nodes={3},
+        )
+        engine = NeuroSymbolicEngine()
+
+        result = engine.check_identifiability(graph, 0, 1)
+
+        self.assertTrue(result["identifiable"])
+        self.assertEqual(result["strategy"], "frontdoor")
+        self.assertEqual(result["adjustment_set"], {2})
+
+    def test_structural_causal_benchmark_passes(self):
+        results = StructuralCausalBenchmark().run()
+
+        self.assertTrue(all(result.passed for result in results), results)
 
     def test_gnn_prune_to_dag_removes_cycles_and_self_loops(self):
         config = self.small_config()
