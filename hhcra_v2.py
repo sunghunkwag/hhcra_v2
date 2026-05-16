@@ -754,10 +754,22 @@ class NeuroSymbolicEngine:
 
     def _blocks_backdoor(self, G, X, Y, Z):
         """Check if Z blocks all backdoor paths from X to Y."""
-        # Remove all edges from X (simulate removing causal paths)
-        # Then check if Z d-separates X from Y in the mutilated graph
-        # Simplified: direct d-separation check
-        return self.d_separated(G, X, Y, Z)
+        # Backdoor paths are tested in G with outgoing edges from X removed,
+        # so directed causal paths from X to Y do not make adjustment fail.
+        mutilated_edges = [
+            (p, c, w)
+            for p, c, w in G.edges
+            if p != X
+        ]
+        mutilated_adjacency = G.adjacency.copy()
+        for child in G.children(X):
+            mutilated_adjacency[child, X] = 0.0
+        mutilated = CausalGraphData(
+            nodes=list(G.nodes),
+            edges=mutilated_edges,
+            adjacency=mutilated_adjacency,
+        )
+        return self.d_separated(mutilated, X, Y, Z)
 
     def _directed_paths(self, G, start, end, max_depth=10):
         """Find all directed paths from start to end."""
